@@ -1,0 +1,178 @@
+import rclpy
+# import the ROS2 python libraries
+from rclpy.node import Node
+# import the Twist module from geometry_msgs interface
+from geometry_msgs.msg import Twist
+# This provides distance reading from LiDAR 
+from sensor_msgs.msg import LaserScan
+# This gives information about the robots current position and orientation 
+from nav_msgs.msg import Odometry
+# QOS settings that handle the reliability of data communications 
+from rclpy.qos import QoSProfile, ReliabilityPolicy
+import math # imports calculations
+import matplotlib.pyplot as plt # using the matplotlib for plotting 
+from PIL import Image # This simply means it opens image
+import signal # THi simport manages the Ctrl+C 
+import sys
+
+# Constants to control WeBot Robot
+LINEAR_VEL = 0.15 # Forward velocity 
+TURN_VEL = 0.3 # Angular velocity (spedd of rotation)
+STOP_DISTANCE = 0.5 # Basically the stopping distance to avoid obstacles
+LIDAR_ERROR = 0.05 # Small error tolerance form the LiDAR sensor 
+FOLLOW_DISTANCE = 0.3 # This should be the desired distance from the wall if not update it 
+LIDAR_AVOID_DISTANCE = 0.7 # This shows the distance at which the robot begins to avoid
+SAFE_STOP_DISTANCE = STOP_DISTANCE + LIDAR_ERROR # Sum of both STOP_DISTANCE and LIDAR_ERROR defining how close the robot is to a obstacle before stopping
+RIGHT_SIDE_INDEX = 270 # Specfic angles of the RIGHT_SIDE using the LIDAR
+RIGHT_FRONT_INDEX = 210 # Specfic angles of the RIGHT_FRONT using the LIDAR
+LEFT_FRONT_INDEX = 150 # Specfic angles of the LEFT_FRONT using the LIDAR
+LEFT_SIDE_INDEX = 90 # Specfic angles of the LEFT_SIDE using the LIDAR
+DOORWAY_THRESHOLD = 1.5 # I adjusted the threshold based 
+TURN_THRESHOLD = 0.5 # YThis the threshold that allows the robot to if its stuck or not 
+
+class RobotForward(Node): # core of ROS2 that establishes the other processers(publish, subscribe, and interact)
+    def __init__(self): # The function _init_ sets up the publisher and subscriptions while aiding the the timers 
+        super().__init__('robot_forward_node')
+        self.publisher_ = self.create_publisher(Twist, 'cmd_vel', 10)
+        self.scan_data = []
+        self.is_moving = False
+        self.cmd = Twist()
+        self.initial_position = (5.2, 6) #(1.8, 6.3) (0.96, 0.492) (7.6, 3.5) # Starting position
+        self.previous_position = None
+        self.total_distance = 0.0
+        self.positions = []
+
+        # Subscriptions for the LaserScan and Odometry
+        self.create_subscription(LaserScan, '/scan', self.Lazer_scan_data, QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)) #
+        self.create_subscription(Odometry, '/odom', self.Update_robot_position, QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)) #
+
+        # Timer for controlling the movement loop
+        self.create_timer(0.1, self.control_loop)
+
+#Helps to handle with sensor errors and noises while advoiding obstacles, the Lazer_scan_data method is used as callback trigger when the LaserScan picks up any data
+
+    def Lazer_scan_data(self, msg): #(self,msg) bascially means the incoming LaserScan data message (This is Input)
+        self.scan_data = [ # (Then this is the ouput) that cleans the list of distances that are assigned 
+            3.5 if r == float('Inf') else (0.0 if math.isnan(r) else r) # for me the INF reads as infinite while the value r is the (distance of reading), oh yea the reason reason I picked 3.5 and not 3.0 was due to the enivornment this is the maximum range or cutoff point then implemented math.isnan where I implemented from stackoverflow and github 
+            for r in msg.ranges # The actual distance list is measure by LiDAR(Laser) sensor (List Comprehension)
+        ]
+
+# This method pretty much updates the robot's position when in motion
+    def Update_robot_position(self, msg): # The method of Odometry receives data 
+        pos = msg.pose.pose.position # method extracts current position\ pos.x ,pos.y
+        normalized_x = pos.x + self.initial_position[0]
+        normalized_y = pos.y + self.initial_position[1]
+
+        if self.previous_position is not None:
+            dx, dy = normalized_x - self.previous_position[0], normalized_y - self.previous_position[1]
+            self.total_distance += math.sqrt(dx ** 2 + dy ** 2)
+
+
+
+
+        self.positions.append((normalized_x, normalized_y)) # This logs the position 
+
+        
+        self.previous_position = (normalized_x, normalized_y) #updates previous explored position 
+        self.get_logger().info(f"Total distance covered: {self.total_distance:.2f} meters") # shows total distance covered by robot
+
+# Movement control for the Webots robots
+    def control_loop(self):
+        if not self.scan_data:
+            self.is_moving = False
+            return
+
+        left_min = min(self.scan_data[LEFT_SIDE_INDEX:LEFT_FRONT_INDEX]) # Webot robot checks the minimum distance (left_min)
+        right_min = min(self.scan_data[RIGHT_FRONT_INDEX:RIGHT_SIDE_INDEX]) # Webot robot checks the minimum distance (right_min)
+        front_min = min(self.scan_data[LEFT_FRONT_INDEX:RIGHT_FRONT_INDEX]) # Webot robot checks the minimum distance (left_min)
+
+# Part of the Obstacle Avoidance: Has the Wall Following method along with Slow Movement when obstacles are detected nearby but not to close
+# Wall Following - Webot robot follows on its right if its detected, but if its too close it moves away, if its far away the robot turns slightly
+# Slow Movement - The robot slows down and adjusts the way it moves if a obstacle is nearby
+        if front_min < SAFE_STOP_DISTANCE:
+            self.cmd.linear.x = 0.0
+            self.cmd.angular.z = TURN_VEL
+            self.is_moving = True
+            self.publisher_.publish(self.cmd)
+            self.get_logger().info("Turning to avoid obstacle")
+        elif front_min < LIDAR_AVOID_DISTANCE:
+            self.cmd.linear.x = LINEAR_VEL / 4
+            self.cmd.angular.z = -0.2 if right_min > left_min else 0.0
+            self.publisher_.publish(self.cmd)
+        else:
+            self.cmd.linear.x = LINEAR_VEL
+            self.cmd.angular.z = 0.0
+
+            if right_min < 0.2:
+                self.cmd.linear.x = LINEAR_VEL / 2
+                self.cmd.angular.z = 0.2
+            elif right_min > 1.0:
+                self.cmd.linear.x = LINEAR_VEL / 2
+                self.cmd.angular.z = -0.2
+            elif right_min > 0.5:
+                self.cmd.linear.x = LINEAR_VEL / 2
+                self.cmd.angular.z = -0.1
+
+            self.publisher_.publish(self.cmd)
+            self.is_moving = True
+
+        self.get_logger().info(f"Front distance obstacle: {front_min}, Right wall distance: {right_min}")
+        self.get_logger().info(f"Command: {self.cmd}")
+
+
+
+ # This opens up the .png saves the positions and plots it 
+    def save_positions(self, filename='robot_path.csv'):
+        with open(filename, 'w') as file:
+            for x, y in self.positions:
+                file.write(f"{x},{y}\n")
+
+
+    def plot_path(self):
+        img = Image.open('/mnt/c/Users/sokeh/Downloads/f24_robotics-main/f24_robotics-main/Homework1/apartment.png')
+        x_vals, y_vals = zip(*self.positions)
+
+        fig, ax = plt.subplots()
+        ax.imshow(img, extent=[-1, 11.5, -0.5, 10])
+        ax.plot(x_vals, y_vals, marker='o', color='orange',linewidth=2)
+
+        ax.set_title("Robot Path Overlaid on Apartment Layout")
+        ax.set_xlabel("X Position (meters)")
+        ax.set_ylabel("Y Position (meters)")
+
+        plt.show()
+        
+# takes the argument robot_forward_node, returns the inner handler function 
+def signal_handler(sig, frame): # found out I can't get rid of this since if I do it will break the whole sequnce got this idea from my friend ()
+# def handler(sig, frame)
+    print("Ctrl+C was dectected! Saving data and plot for future references...  ")
+    if 'robot_forward_node' in globals():
+        robot_forward_node.save_positions()
+        robot_forward_node.plot_path()
+        robot_forward_node.destroy_node()
+    rclpy.shutdown()
+    sys.exit(0)
+
+#     Display {
+#   rotation 1 0 0 3.14
+#   width 128
+#   height 128
+#   windowPosition 0 1
+# }
+#  display = wb_robot_get_device("display")
+#  width = wb_display_get_width(display)
+#  height = wb_display_get_height(display)
+#  wb_display_fill_rectangle(display,0,0,width,height)
+#  wb_display_set_color(display,LIGHT_GREY)
+
+def main(args=None):
+    rclpy.init(args=args)
+    
+    global robot_forward_node # come back and change if needed 
+    robot_forward_node = RobotForward()
+
+    signal.signal(signal.SIGINT, signal_handler) #(robot_forward_node))
+    rclpy.spin(robot_forward_node)
+
+if __name__ == '__main__':
+    main()
